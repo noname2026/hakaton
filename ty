@@ -1,1 +1,596 @@
-print("hi")
+import cv2
+import numpy as np
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from PIL import Image, ImageTk
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import os
+import subprocess
+import shutil
+
+
+def generate_and_save_normal_map(self, image, strength=2.0, save_name="normal_map.png"):
+    # Генерация карты нормалей
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    gray_float = gray.astype(np.float32) / 255.0
+
+    dx = cv2.Sobel(gray_float, cv2.CV_32F, 1, 0, ksize=3)
+    dy = cv2.Sobel(gray_float, cv2.CV_32F, 0, 1, ksize=3)
+
+    dx *= strength
+    dy *= strength
+
+    dz = np.ones_like(dx)
+    length = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+
+    normal_x = dx / length
+    normal_y = dy / length
+    normal_z = dz / length
+
+    r = (normal_x + 1) * 127.5
+    g = (normal_y + 1) * 127.5
+    b = (normal_z + 1) * 127.5
+
+    normal_map = np.stack([r, g, b], axis=2).astype(np.uint8)
+
+    # Формируем путь сохранения в папке с этим скриптом
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    save_path = os.path.join(script_dir, save_name)
+
+    # Сохраняем карту нормалей в папке скрипта
+    cv2.imwrite(save_path, cv2.cvtColor(normal_map, cv2.COLOR_RGB2BGR))
+    print(f"Карта нормалей сохранена: {save_path}")
+
+    return normal_map, save_path
+
+
+class SymbolQualityChecker:
+    def __init__(self):
+        pass
+
+    def analyze_contour_quality(self, contour, image_region):
+        """Анализ качества контура"""
+        try:
+            mask = np.zeros(image_region.shape[:2], dtype=np.uint8)
+            cv2.drawContours(mask, [contour], -1, 255, -1)
+            area = cv2.contourArea(contour)
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter > 0:
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+            else:
+                circularity = 0
+            epsilon = 0.02 * perimeter
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            smoothness = len(approx) / len(contour) if len(contour) > 0 else 1.0
+            quality_score = (circularity + (1 - smoothness)) / 2
+            return max(0.0, min(1.0, quality_score))
+        except:
+            return 0.5
+
+
+class TextureCreatorTool:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Texture Creator Tool с нейросетевым контролем символов")
+        self.root.geometry("1400x900")
+
+        self.original_image = None
+        self.current_texture = None
+        self.texture_type = "normal"
+        self.quality_checker = SymbolQualityChecker()
+        self.processed_image = None
+        self.create_folders()
+
+        self.create_interface()
+
+    def create_folders(self):
+        """Создает папки для дефектных и не дефектных деталей"""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.defective_folder = os.path.join(script_dir, "дефектные")
+        self.non_defective_folder = os.path.join(script_dir, "не_дефектные")
+
+        # Создаем папки если они не существуют
+        os.makedirs(self.defective_folder, exist_ok=True)
+        os.makedirs(self.non_defective_folder, exist_ok=True)
+
+        print(f"Папки созданы: {self.defective_folder}, {self.non_defective_folder}")
+
+    def create_interface(self):
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        left_frame = ttk.Frame(main_frame, width=350)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        left_frame.pack_propagate(False)
+
+        right_frame = ttk.Frame(main_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        load_frame = ttk.LabelFrame(left_frame, text="Загрузка изображения", padding=10)
+        load_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Button(load_frame, text="Загрузить изображение",
+                   command=self.load_image).pack(fill=tk.X)
+
+        nn_frame = ttk.LabelFrame(left_frame, text="Контроль качества символов", padding=10)
+        nn_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(nn_frame, text="Порог качества контуров:").pack(anchor=tk.W)
+        self.contour_quality_threshold = tk.DoubleVar(value=0.7)
+        ttk.Scale(nn_frame, from_=0.1, to=1.0, variable=self.contour_quality_threshold,
+                  orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        ttk.Label(nn_frame, text="Минимальный размер символа:").pack(anchor=tk.W)
+        self.min_symbol_size = tk.IntVar(value=50)
+        ttk.Scale(nn_frame, from_=10, to=200, variable=self.min_symbol_size,
+                  orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        self.nn_quality_label = ttk.Label(nn_frame, text="Качество контуров: -")
+        self.nn_quality_label.pack(anchor=tk.W, pady=2)
+
+        self.nn_result_label = ttk.Label(nn_frame, text="Статус: -", font=('Arial', 12, 'bold'))
+        self.nn_result_label.pack(anchor=tk.W, pady=2)
+
+        ttk.Button(nn_frame, text="Проверить контуры символов",
+                   command=self.check_contour_quality).pack(fill=tk.X, pady=2)
+
+        texture_frame = ttk.LabelFrame(left_frame, text="Тип текстуры", padding=10)
+        texture_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.texture_var = tk.StringVar(value="normal")
+        textures = [
+            ("Карта нормалей", "normal"),
+            ("Карта высот", "height"),
+            ("Карта Ambient Occlusion", "ao"),
+            ("Карта шероховатости", "roughness"),
+            ("Карта металличности", "metallic"),
+            ("Диффузная текстура", "diffuse")
+        ]
+
+        for text, value in textures:
+            ttk.Radiobutton(texture_frame, text=text, variable=self.texture_var,
+                            value=value, command=self.update_texture).pack(anchor=tk.W)
+
+        self.normal_frame = ttk.LabelFrame(left_frame, text="Настройки нормалей", padding=10)
+        self.normal_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(self.normal_frame, text="Сила эффекта:").pack(anchor=tk.W)
+        self.normal_strength = tk.DoubleVar(value=2.0)
+        ttk.Scale(self.normal_frame, from_=0.1, to=5.0, variable=self.normal_strength,
+                  orient=tk.HORIZONTAL, command=self.update_texture).pack(fill=tk.X)
+
+        export_frame = ttk.LabelFrame(left_frame, text="Экспорт", padding=10)
+        export_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Button(export_frame, text="Сохранить текстуру",
+                   command=self.save_texture).pack(fill=tk.X, pady=2)
+        ttk.Button(export_frame, text="Сохранить все текстуры",
+                   command=self.save_all_textures).pack(fill=tk.X, pady=2)
+
+        self.preview_frame = ttk.LabelFrame(right_frame, text="Предпросмотр", padding=10)
+        self.preview_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.fig, ((self.ax1, self.ax2), (self.ax3, self.ax4)) = plt.subplots(2, 2, figsize=(12, 8))
+        self.canvas = FigureCanvasTkAgg(self.fig, self.preview_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self.update_display()
+
+    def load_image(self):
+        file_path = filedialog.askopenfilename(
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff")]
+        )
+        if file_path:
+            self.original_image = cv2.imread(file_path)
+            if self.original_image is not None:
+                self.original_image = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB)
+                self.update_texture()
+                messagebox.showinfo("Успех", "Изображение успешно загружено!")
+            else:
+                messagebox.showerror("Ошибка", "Не удалось загрузить изображение")
+
+    def preprocess_for_symbol_detection(self, image):
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        binary = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+
+        kernel = np.ones((2, 2), np.uint8)
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+
+        return cleaned, enhanced
+
+    def detect_potential_symbols(self, binary_image):
+        contours, _ = cv2.findContours(
+            binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        symbols = []
+        min_size = self.min_symbol_size.get()
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_size:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = w / h
+            if 0.3 < aspect_ratio < 3.0:
+                perimeter = cv2.arcLength(contour, True)
+                if perimeter > 0:
+                    circularity = 4 * np.pi * area / (perimeter * perimeter)
+
+                    symbols.append({
+                        'contour': contour,
+                        'bbox': (x, y, w, h),
+                        'area': area,
+                        'circularity': circularity,
+                        'aspect_ratio': aspect_ratio
+                    })
+
+        return symbols
+
+    def analyze_contour_smoothness(self, contour):
+        epsilon = 0.02 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        smoothness_ratio = len(approx) / len(contour) if len(contour) > 0 else 1.0
+        return smoothness_ratio
+
+    def process_normal_map(self):
+        """Обработка карты нормалей по указанному алгоритму"""
+        try:
+            # Загружаем сохраненную карту нормалей
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            normal_map_path = os.path.join(script_dir, "normal_map.png")
+
+            if not os.path.exists(normal_map_path):
+                messagebox.showerror("Ошибка", "Карта нормалей не найдена. Сначала создайте карту нормалей.")
+                return None
+
+            image = cv2.imread(normal_map_path)  # загрузка фотографии
+            new_img = cv2.resize(image, (image.shape[1] // 3, image.shape[0] // 3))  # уменьшение разрешения
+            new_img = cv2.GaussianBlur(new_img, (5, 5), 0)  # размытие по гауссу
+            new_img = cv2.cvtColor(new_img, cv2.COLOR_BGR2GRAY)  # ЧЕРНО-БЕЛАЯ ФОТКА
+            new_img = cv2.Canny(new_img, 100, 100)  # белая обводка на черном
+
+            kernel = np.ones((5, 5), np.uint8)
+            # new_img = cv2.dilate(new_img, kernel, iterations=1)
+            # new_img = cv2.erode(new_img, kernel, iterations=1)
+
+            return new_img
+
+        except Exception as e:
+            print(f"Ошибка при обработке карты нормалей: {str(e)}")
+            return None
+
+    def save_to_folder(self, is_defective):
+        """Сохраняет текущее изображение в соответствующую папку"""
+        try:
+            if self.original_image is None:
+                messagebox.showwarning("Предупреждение", "Нет изображения для сохранения")
+                return
+
+            # Определяем имя файла
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"деталь_{timestamp}.png"
+
+            # Выбираем папку назначения
+            target_folder = self.defective_folder if is_defective else self.non_defective_folder
+            file_path = os.path.join(target_folder, filename)
+
+            # Сохраняем оригинальное изображение
+            save_image = cv2.cvtColor(self.original_image, cv2.COLOR_RGB2BGR)
+            success = cv2.imwrite(file_path, save_image)
+
+            if success:
+                folder_name = "дефектные" if is_defective else "не дефектные"
+                print(f"Изображение сохранено в папку '{folder_name}': {file_path}")
+            else:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить изображение в папку")
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при сохранении: {str(e)}")
+
+    def check_contour_quality(self):
+        if self.current_texture is None:
+            messagebox.showwarning("Предупреждение", "Сначала создайте карту нормалей")
+            return
+
+        try:
+            # Обрабатываем карту нормалей
+            self.processed_image = self.process_normal_map()
+
+            if self.processed_image is None:
+                return
+
+            # Анализ контуров на обработанном изображении
+            analysis_image = cv2.cvtColor(self.processed_image, cv2.COLOR_GRAY2RGB)
+            binary, enhanced = self.preprocess_for_symbol_detection(analysis_image)
+            symbols = self.detect_potential_symbols(binary)
+
+            if not symbols:
+                self.nn_quality_label.config(text="Качество контуров: Символы не обнаружены")
+                self.nn_result_label.config(text="Статус: ❌ БРАК (нет символов)", foreground="red")
+                self.save_to_folder(True)  # Сохраняем в дефектные
+
+                self.ax3.clear()
+                self.ax4.clear()
+                self.ax3.text(0.5, 0.5, "Символы не обнаружены",
+                              ha='center', va='center', transform=self.ax3.transAxes)
+                self.ax3.axis('off')
+
+                # Показываем обработанное изображение
+                self.ax4.imshow(self.processed_image, cmap='gray')
+                self.ax4.set_title("Обработанная карта нормалей")
+                self.ax4.axis('off')
+
+                self.canvas.draw()
+                return
+
+            contour_qualities = []
+            defects = []
+
+            for i, symbol in enumerate(symbols):
+                contour_quality = self.quality_checker.analyze_contour_quality(
+                    symbol['contour'],
+                    binary[symbol['bbox'][1]:symbol['bbox'][1] + symbol['bbox'][3],
+                    symbol['bbox'][0]:symbol['bbox'][0] + symbol['bbox'][2]]
+                )
+
+                smoothness = self.analyze_contour_smoothness(symbol['contour'])
+                combined_quality = (contour_quality + (1 - smoothness)) / 2
+
+                contour_qualities.append(combined_quality)
+
+                if combined_quality < self.contour_quality_threshold.get():
+                    defects.append(f"Символ {i + 1}: контур 'поплыл' (качество: {combined_quality:.2f})")
+
+            avg_quality = np.mean(contour_qualities) if contour_qualities else 0.0
+            threshold = self.contour_quality_threshold.get()
+
+            self.nn_quality_label.config(text=f"Среднее качество контуров: {avg_quality:.2%}")
+
+            is_defective = avg_quality < threshold or len(defects) > 0
+
+            if not is_defective:
+                self.nn_result_label.config(text="Статус: ✅ ДЕТАЛЬ ИСПРАВНА", foreground="green")
+                self.save_to_folder(False)  # Сохраняем в не дефектные
+            else:
+                defect_text = "\n".join(defects[:3])
+                self.nn_result_label.config(text=f"Статус: ❌ БРАК\n{defect_text}", foreground="red")
+                self.save_to_folder(True)  # Сохраняем в дефектные
+
+            # Обновляем отображение
+            self.ax3.clear()
+            self.ax4.clear()
+
+            # Показываем контуры на обработанном изображении
+            contour_image = analysis_image.copy()
+            for symbol in symbols:
+                x, y, w, h = symbol['bbox']
+                cv2.rectangle(contour_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            self.ax3.imshow(contour_image)
+            self.ax3.set_title("Обнаруженные символы")
+            self.ax3.axis('off')
+
+            # Показываем обработанное изображение
+            self.ax4.imshow(self.processed_image, cmap='gray')
+            self.ax4.set_title("Обработанная карта нормалей")
+            self.ax4.axis('off')
+
+            self.canvas.draw()
+
+            return avg_quality
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при обработке: {str(e)}")
+
+    def generate_normal_map(self, image, strength=2.0):
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        gray_float = gray.astype(np.float32) / 255.0
+
+        dx = cv2.Sobel(gray_float, cv2.CV_32F, 1, 0, ksize=3)
+        dy = cv2.Sobel(gray_float, cv2.CV_32F, 0, 1, ksize=3)
+
+        dx *= strength
+        dy *= strength
+
+        dz = np.ones_like(dx)
+        length = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+
+        normal_x = dx / length
+        normal_y = dy / length
+        normal_z = dz / length
+
+        r = (normal_x + 1) * 127.5
+        g = (normal_y + 1) * 127.5
+        b = (normal_z + 1) * 127.5
+
+        normal_map = np.stack([r, g, b], axis=2).astype(np.uint8)
+
+        # Автоматическое сохранение карты нормалей
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        save_path = os.path.join(script_dir, "normal_map.png")
+        save_image = cv2.cvtColor(normal_map, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(save_path, save_image)
+        print(f"Карта нормалей сохранена: {save_path}")
+
+        return normal_map
+
+    def generate_height_map(self, image, contrast=1.5):
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        gray_float = gray.astype(np.float32) / 255.0
+        gray_float = np.power(gray_float, contrast)
+        height_map = (gray_float * 255).astype(np.uint8)
+        return cv2.cvtColor(height_map, cv2.COLOR_GRAY2RGB)
+
+    def generate_ao_map(self, image, intensity=1.0):
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        ao = cv2.GaussianBlur(gray, (15, 15), 0)
+        ao_float = ao.astype(np.float32) / 255.0
+        ao_float = np.power(ao_float, intensity)
+        ao = (ao_float * 255).astype(np.uint8)
+        return cv2.cvtColor(ao, cv2.COLOR_GRAY2RGB)
+
+    def generate_roughness_map(self, image):
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        roughness = 255 - gray
+        noise = np.random.randint(0, 30, gray.shape, dtype=np.uint8)
+        roughness = cv2.addWeighted(roughness, 0.8, noise, 0.2, 0)
+        return cv2.cvtColor(roughness, cv2.COLOR_GRAY2RGB)
+
+    def generate_metallic_map(self, image):
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        _, metallic = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+        metallic = cv2.GaussianBlur(metallic, (5, 5), 0)
+        return cv2.cvtColor(metallic, cv2.COLOR_GRAY2RGB)
+
+    def generate_diffuse_texture(self, image):
+        diffuse = cv2.GaussianBlur(image, (3, 3), 0)
+        return diffuse
+
+    def update_texture(self, *args):
+        if self.original_image is None:
+            return
+
+        texture_type = self.texture_var.get()
+
+        if texture_type == "normal":
+            strength = self.normal_strength.get()
+            self.current_texture = self.generate_normal_map(self.original_image, strength)
+        elif texture_type == "height":
+            self.current_texture = self.generate_height_map(self.original_image, 1.5)
+        elif texture_type == "ao":
+            self.current_texture = self.generate_ao_map(self.original_image, 1.0)
+        elif texture_type == "roughness":
+            self.current_texture = self.generate_roughness_map(self.original_image)
+        elif texture_type == "metallic":
+            self.current_texture = self.generate_metallic_map(self.original_image)
+        elif texture_type == "diffuse":
+            self.current_texture = self.generate_diffuse_texture(self.original_image)
+
+        self.update_display()
+
+    def update_display(self):
+        self.ax1.clear()
+        self.ax2.clear()
+        self.ax3.clear()
+        self.ax4.clear()
+
+        if self.original_image is not None:
+            self.ax1.imshow(self.original_image)
+            self.ax1.set_title("Оригинальное изображение")
+            self.ax1.axis('off')
+
+            if self.current_texture is not None:
+                self.ax2.imshow(self.current_texture)
+                texture_names = {
+                    "normal": "Карта нормалей",
+                    "height": "Карта высот",
+                    "ao": "Ambient Occlusion",
+                    "roughness": "Карта шероховатости",
+                    "metallic": "Карта металличности",
+                    "diffuse": "Диффузная текстура"
+                }
+                self.ax2.set_title(texture_names[self.texture_var.get()])
+                self.ax2.axis('off')
+            else:
+                self.ax2.text(0.5, 0.5, "Выберите тип текстуры",
+                              ha='center', va='center', transform=self.ax2.transAxes)
+                self.ax2.axis('off')
+        else:
+            self.ax1.text(0.5, 0.5, "Загрузите изображение",
+                          ha='center', va='center', transform=self.ax1.transAxes)
+            self.ax1.axis('off')
+            self.ax2.axis('off')
+
+        self.ax3.axis('off')
+        self.ax4.axis('off')
+
+        self.canvas.draw()
+
+    def save_texture(self):
+        if self.current_texture is None:
+            messagebox.showwarning("Предупреждение", "Сначала создайте текстуру")
+            return
+
+        try:
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".png",
+                filetypes=[
+                    ("PNG files", "*.png"),
+                    ("JPEG files", "*.jpg"),
+                    ("All files", "*.*")
+                ]
+            )
+
+            if file_path:
+                if not file_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    file_path += '.png'
+
+                save_image = cv2.cvtColor(self.current_texture, cv2.COLOR_RGB2BGR)
+                success = cv2.imwrite(file_path, save_image)
+                if success:
+                    messagebox.showinfo("Успех", f"Текстура сохранена как: {file_path}")
+                else:
+                    messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {file_path}")
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при сохранении: {str(e)}")
+
+    def save_all_textures(self):
+        if self.original_image is None:
+            messagebox.showwarning("Предупреждение", "Сначала загрузите изображение")
+            return
+
+        try:
+            folder_path = filedialog.askdirectory()
+            if not folder_path:
+                return
+
+            textures = {
+                "normal": self.generate_normal_map(self.original_image, self.normal_strength.get()),
+                "height": self.generate_height_map(self.original_image, 1.5),
+                "ao": self.generate_ao_map(self.original_image, 1.0),
+                "roughness": self.generate_roughness_map(self.original_image),
+                "metallic": self.generate_metallic_map(self.original_image),
+                "diffuse": self.generate_diffuse_texture(self.original_image)
+            }
+
+            saved_files = []
+
+            for name, texture in textures.items():
+                file_path = os.path.join(folder_path, f"{name}_map.png")
+                save_image = cv2.cvtColor(texture, cv2.COLOR_RGB2BGR)
+
+                if cv2.imwrite(file_path, save_image):
+                    saved_files.append(file_path)
+                else:
+                    messagebox.showwarning("Предупреждение", f"Не удалось сохранить: {file_path}")
+
+            if saved_files:
+                messagebox.showinfo("Успех", f"Сохранено {len(saved_files)} текстур в: {folder_path}")
+            else:
+                messagebox.showerror("Ошибка", "Не удалось сохранить ни одной текстуры")
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при сохранении текстур: {str(e)}")
+
+
+def main():
+    root = tk.Tk()
+    app = TextureCreatorTool(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
